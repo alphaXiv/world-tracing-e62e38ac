@@ -15,6 +15,17 @@ cd "$(dirname "$0")"
 
 echo "[run] python: $(python --version 2>&1), torch: $(python -c 'import torch; print(torch.__version__)' 2>/dev/null || echo 'not yet installed')"
 
+# wt imports torch.utils.checkpoint.CheckpointPolicy at module load (added in
+# torch 2.5). The base image ships torch 2.4.1, and `torch>=2.2` in pyproject
+# does not force an upgrade, so pin a torch that has the symbol first.
+echo "[run] ensuring torch >= 2.5 (CheckpointPolicy) ..."
+python - <<'PY' || pip install -q "torch==2.6.0"
+import sys
+from packaging.version import parse
+import torch
+sys.exit(0 if parse(torch.__version__.split("+")[0]) >= parse("2.5") else 1)
+PY
+
 # Install the inference package (base deps only: torch, numpy, opencv,
 # einops, safetensors, huggingface_hub, structlog, beartype, jaxtyping).
 echo "[run] installing wt (editable) ..."
