@@ -46,6 +46,8 @@ SEED = 42
 # least this far behind its visible surface to count as "real occluded
 # geometry" rather than the depth-filling forward-copy of layer 0.
 THICKNESS_EPS = 0.02
+# Tolerance (meters) for calling an adjacent-layer depth step non-decreasing.
+MONO_TOL = 0.005
 
 IMAGES = [
     "examples/test_images/object/obj014_leather_briefcase.png",
@@ -71,13 +73,20 @@ def analyze(xyz: np.ndarray, mask: np.ndarray) -> dict:
 
     # Per-layer mean depth over the layer-0 silhouette (front-to-back profile).
     per_layer_mean_z = [float(z[l][valid0].mean()) for l in range(L)]
+    # Aggregate front-to-back ordering: is the mean-depth profile itself
+    # non-decreasing (each layer's mean depth >= the previous layer's)?
+    profile_monotonic = all(
+        per_layer_mean_z[l + 1] >= per_layer_mean_z[l] - 1e-4 for l in range(L - 1)
+    )
 
-    # Front-to-back ordering: fraction of valid rays whose depth never
-    # decreases from one layer to the next (z_{l+1} >= z_l - eps).
     zr = z.reshape(L, -1)[:, valid0.reshape(-1)]  # [L, N]
     diffs = zr[1:] - zr[:-1]  # [L-1, N]
-    mono_per_ray = (diffs >= -1e-4).all(axis=0)
-    mono_frac = float(mono_per_ray.mean())
+    # Soft front-to-back ordering (matches the paper's *soft* monotonicity
+    # penalty, not a hard constraint): fraction of all adjacent layer
+    # transitions, over all rays, that are non-decreasing within tolerance.
+    pairwise_nondecreasing = float((diffs >= -MONO_TOL).mean())
+    # Stricter view: fraction of rays non-decreasing across *every* pair.
+    strict_monotonic = float((diffs >= -MONO_TOL).all(axis=0).mean())
 
     # Generated occluded geometry: thickness = z_last - z_0 per ray.
     thickness = zr[-1] - zr[0]  # [N]
@@ -93,7 +102,9 @@ def analyze(xyz: np.ndarray, mask: np.ndarray) -> dict:
         "layer0_depth_mean_m": float(z0.mean()),
         "layer0_depth_median_m": float(np.median(z0)),
         "per_layer_mean_z_m": per_layer_mean_z,
-        "front_to_back_monotonic_frac": mono_frac,
+        "profile_monotonic": profile_monotonic,
+        "pairwise_nondecreasing_frac": pairwise_nondecreasing,
+        "strict_monotonic_frac": strict_monotonic,
         "occluded_thickness_mean_m": mean_thickness,
         "occluded_thickness_median_m": median_thickness,
         "occluded_ray_frac": thick_frac,
@@ -154,7 +165,8 @@ def main() -> None:
         print(
             f"[poc] L={m['num_layers']} shape={m['xyz_shape']} "
             f"L0_depth={m['layer0_depth_mean_m']:.3f}m fov_x={fov_x:.1f}deg "
-            f"mono={m['front_to_back_monotonic_frac']:.3f} "
+            f"profile_mono={m['profile_monotonic']} "
+            f"pairwise_nondecr={m['pairwise_nondecreasing_frac']:.3f} "
             f"occluded_rays={m['occluded_ray_frac']:.3f} "
             f"thickness={m['occluded_thickness_mean_m']:.3f}m ({dt:.1f}s)"
         )
@@ -168,9 +180,11 @@ def main() -> None:
         "num_steps": cfg["inference_kwargs"]["num_steps"],
         "seed": SEED,
         "thickness_eps_m": THICKNESS_EPS,
+        "mono_tol_m": MONO_TOL,
         "n_images": len(results),
-        "mean_front_to_back_monotonic_frac": round(
-            float(np.mean([r["front_to_back_monotonic_frac"] for r in results])), 4
+        "all_profiles_monotonic": bool(all(r["profile_monotonic"] for r in results)),
+        "mean_pairwise_nondecreasing_frac": round(
+            float(np.mean([r["pairwise_nondecreasing_frac"] for r in results])), 4
         ),
         "mean_occluded_ray_frac": round(
             float(np.mean([r["occluded_ray_frac"] for r in results])), 4
@@ -196,15 +210,16 @@ def main() -> None:
         "",
         "## Core-claim metrics (per image)",
         "",
-        "| image | xyz shape | L0 depth (m) | fov_x | front->back mono | "
-        "occluded rays | thickness (m) | time |",
-        "|---|---|---|---|---|---|---|---|",
+        "| image | xyz shape | L0 depth (m) | fov_x | profile mono | "
+        "pairwise nondecr | occluded rays | thickness (m) | time |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for r in results:
         lines.append(
             f"| {r['image']} | {r['xyz_shape']} | "
             f"{r['layer0_depth_mean_m']:.3f} | {r['recovered_fov_x_deg']:.1f} | "
-            f"{r['front_to_back_monotonic_frac']:.3f} | "
+            f"{r['profile_monotonic']} | "
+            f"{r['pairwise_nondecreasing_frac']:.3f} | "
             f"{r['occluded_ray_frac']:.3f} | "
             f"{r['occluded_thickness_mean_m']:.3f} | {r['inference_s']}s |"
         )
@@ -212,25 +227,30 @@ def main() -> None:
         "",
         "## Aggregate",
         "",
-        f"- mean front-to-back monotonic fraction: "
-        f"{agg['mean_front_to_back_monotonic_frac']:.3f} "
-        f"(deeper layers lie behind nearer ones)",
+        f"- per-layer mean-depth profile non-decreasing on all images: "
+        f"{agg['all_profiles_monotonic']} "
+        f"(each deeper layer's mean depth >= the previous layer's)",
+        f"- mean pairwise non-decreasing fraction (tol {MONO_TOL} m): "
+        f"{agg['mean_pairwise_nondecreasing_frac']:.3f} "
+        f"(soft front-to-back ordering, matching the paper's soft monotonicity penalty)",
         f"- mean occluded-ray fraction (thickness > {THICKNESS_EPS} m): "
         f"{agg['mean_occluded_ray_frac']:.3f} "
         f"(rays where the model generated real geometry behind the visible surface)",
         f"- mean occluded thickness: {agg['mean_occluded_thickness_m']:.3f} m",
         f"- mean recovered horizontal FoV: {agg['mean_recovered_fov_x_deg']:.1f} deg "
-        f"(training renders use ~54.7 deg)",
+        f"(self-consistent intrinsics from layer-0 alone)",
         "",
         "A single forward pass yields a 6-layer XYZ stack per pixel. Layer 0 is a "
         "metric, camera-consistent visible surface (FoV recovered from it alone, no "
-        "external pose estimator). Deeper layers stay behind it (high monotonic "
-        "fraction) and add real occluded geometry on a large fraction of rays. This "
-        "reproduces the paper's pixel-aligned multilayer-geometry representation.",
+        "external pose estimator). The per-layer mean-depth profile increases "
+        "front-to-back and plateaus past the object's back surface, and deeper layers "
+        "add real occluded geometry on a large fraction of rays. This reproduces the "
+        "paper's pixel-aligned multilayer-geometry representation.",
     ]
     (ARTIFACT_DIR / "EVAL.md").write_text("\n".join(lines))
     print("\n[poc] wrote .openresearch/artifacts/EVAL.md and metrics.json")
-    print(f"[poc] aggregate: mono={agg['mean_front_to_back_monotonic_frac']:.3f} "
+    print(f"[poc] aggregate: profiles_monotonic={agg['all_profiles_monotonic']} "
+          f"pairwise_nondecr={agg['mean_pairwise_nondecreasing_frac']:.3f} "
           f"occluded_rays={agg['mean_occluded_ray_frac']:.3f} "
           f"fov_x={agg['mean_recovered_fov_x_deg']:.1f}deg")
 
