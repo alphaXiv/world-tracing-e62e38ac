@@ -36,10 +36,15 @@ python -c "import torch; print('[run] CUDA available:', torch.cuda.is_available(
 # The released r75b checkpoint is gated on Hugging Face; downloading it needs a
 # token authorized on haoz19/object-model-6layer. huggingface_hub picks up
 # HF_TOKEN / HUGGING_FACE_HUB_TOKEN / a cached ~/.cache/huggingface/token.
-python - <<'PY'
-from huggingface_hub import HfFolder
+python - <<'PY' || true
 import os
-tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or HfFolder.get_token()
+tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+if not tok:
+    try:
+        from huggingface_hub import get_token  # modern API
+        tok = get_token()
+    except Exception:
+        tok = None
 if not tok:
     print("[run] HF token: NONE visible in run environment")
 else:
