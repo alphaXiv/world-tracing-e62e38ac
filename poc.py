@@ -85,6 +85,23 @@ def analyze(xyz: np.ndarray, mask: np.ndarray) -> dict:
     mean_thickness = float(thickness.mean())
     median_thickness = float(np.median(thickness))
 
+    # Per-layer-pair depth gaps over the layer-0 silhouette: for each
+    # consecutive pair (l, l+1), gap = z_{l+1} - z_l. This decomposes the
+    # aggregate thickness into per-pair contributions and tests whether each
+    # of the L-1 layer transitions actually carries distinct occluded
+    # geometry, or whether layers collapse (gap ~ 0) onto a nearer layer.
+    per_layer_gap_m = [
+        {
+            "pair": [l, l + 1],
+            "mean_m": float(diffs[l].mean()),
+            "median_m": float(np.median(diffs[l])),
+        }
+        for l in range(L - 1)
+    ]
+    per_layer_fresh_ray_frac = [
+        float((diffs[l] > THICKNESS_EPS).mean()) for l in range(L - 1)
+    ]
+
     # Layer-0 visible surface depth (metric).
     z0 = zr[0]
     return {
@@ -97,6 +114,8 @@ def analyze(xyz: np.ndarray, mask: np.ndarray) -> dict:
         "occluded_thickness_mean_m": mean_thickness,
         "occluded_thickness_median_m": median_thickness,
         "occluded_ray_frac": thick_frac,
+        "per_layer_gap_m": per_layer_gap_m,
+        "per_layer_fresh_ray_frac": per_layer_fresh_ray_frac,
     }
 
 
@@ -210,6 +229,26 @@ def main() -> None:
         )
     lines += [
         "",
+        "## Per-layer-pair depth gaps (over layer-0 silhouette)",
+        "",
+        "For each consecutive layer pair (l, l+1), mean/median of "
+        f"z_{{l+1}}-z_l and fraction of rays with gap > {THICKNESS_EPS} m "
+        "(\"fresh\" rays where layer l+1 actually contributes new occluded "
+        "geometry rather than collapsing onto layer l).",
+        "",
+    ]
+    for r in results:
+        lines.append(f"### {r['image']}")
+        lines.append("")
+        lines.append("| pair | gap mean (m) | gap median (m) | fresh ray frac |")
+        lines.append("|---|---|---|---|")
+        for g, ff in zip(r["per_layer_gap_m"], r["per_layer_fresh_ray_frac"]):
+            lines.append(
+                f"| {g['pair'][0]}->{g['pair'][1]} | "
+                f"{g['mean_m']:.3f} | {g['median_m']:.3f} | {ff:.3f} |"
+            )
+        lines.append("")
+    lines += [
         "## Aggregate",
         "",
         f"- mean front-to-back monotonic fraction: "
