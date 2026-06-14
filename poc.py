@@ -20,6 +20,13 @@ machine-readable evidence so the claim can be judged numerically:
   * generated occluded-surface "thickness": per-ray (z_last - z_0) > eps,
     i.e. deeper layers are genuinely behind the visible surface, not copies
 
+It additionally runs a public MoGe-2 (``moge-2-vitl-normal``) forward on the
+same RGB inputs and reports ``baseline_moge_depth_mean_m`` /
+``baseline_moge_fov_x_deg`` next to r75b's layer-0 numbers. r75b freezes the
+MoGe encoder, so this baseline isolates the frozen-encoder share of the
+visible-surface depth / FoV from the diffusion decoder, and produces
+partial evidence even when the gated r75b checkpoint cannot be downloaded.
+
 Artifacts written to .openresearch/artifacts/:
   * EVAL.md      -- human-readable summary table
   * metrics.json -- per-image + aggregate metrics (text, CLI-readable)
@@ -35,7 +42,8 @@ import numpy as np
 import torch
 
 from wt import inference_diffusion, solve_intrinsics_from_xyz
-from wt.checkpoint import build_model_and_load_ckpt
+from wt._core.vendor.moge.moge2_runner import MoGe2Runner
+from wt.checkpoint import CONFIGS, build_model_and_load_ckpt
 from wt.data import load_rgba_image, preprocess_rgba_for_model
 from wt.inference import _bypass_activation_checkpointing
 
@@ -106,9 +114,30 @@ def main() -> None:
     if device.type != "cuda":
         raise SystemExit("This PoC requires a CUDA GPU (bf16 autocast path).")
 
+    # MoGe-2 layer-0 baseline (public `moge-2-vitl-normal` weights, no gating).
+    # r75b freezes the MoGe encoder, so comparing r75b's layer-0 numbers to a
+    # bare MoGe-2 forward isolates how much of the visible-surface depth/FoV
+    # comes from the frozen encoder vs the diffusion decoder. Instantiated
+    # first so it still produces evidence on runs where the gated r75b
+    # checkpoint download fails below.
+    print("[poc] building MoGe-2 baseline (moge-2-vitl-normal) ...")
+    moge_runner = MoGe2Runner(device=str(device))
+
     print(f"[poc] building {CONFIG} and loading released checkpoint ...")
-    model, cfg = build_model_and_load_ckpt(CONFIG, CKPT, device)
-    n_params = sum(p.numel() for p in model.parameters()) / 1e9
+    try:
+        model, cfg = build_model_and_load_ckpt(CONFIG, CKPT, device)
+        r75b_available = True
+        n_params = sum(p.numel() for p in model.parameters()) / 1e9
+    except Exception as exc:  # noqa: BLE001 -- gated HF download / network / auth
+        print(
+            f"[poc] WARNING: could not load {CONFIG} checkpoint ({exc!r}). "
+            "Reporting MoGe-2 baseline columns only; r75b layer-0 metrics "
+            "will be null."
+        )
+        model = None
+        cfg = CONFIGS[CONFIG]
+        r75b_available = False
+        n_params = 0.0
     autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
 
     results = []
@@ -124,42 +153,94 @@ def main() -> None:
         )
         rgb_t, mask_t, intr_t = rgb_t.to(device), mask_t.to(device), intr_t.to(device)
 
-        torch.manual_seed(SEED)
-        torch.cuda.manual_seed(SEED)
-        t0 = time.time()
-        with torch.no_grad(), autocast_ctx, _bypass_activation_checkpointing(model):
-            xyz_pred, mask_pred, _ = inference_diffusion(
-                model,
-                rgb_t,
-                gt_mask=mask_t,
-                use_gt_mask=True,
-                intrinsics=intr_t,
-                invalid_fill_mode="noise",
-                **cfg["inference_kwargs"],
-            )
-        dt = time.time() - t0
-
-        xyz = xyz_pred[0].float().cpu().numpy()  # [L, H, W, 3]
-        mask = mask_pred[0].cpu().numpy().astype(bool)  # [L, H, W]
-        m = analyze(xyz, mask)
-
-        K, fov_x = solve_intrinsics_from_xyz(
-            xyz[0], mask[0], image_size=cfg["image_size"]
+        # ---- MoGe-2 layer-0 baseline (always runs, public weights). ----
+        rgb_hwc = rgb_t.permute(0, 2, 3, 1).contiguous()  # [1, H, W, 3]
+        moge_out = moge_runner(rgb_hwc)
+        fg0 = mask_t[0, 0].bool()
+        moge_depth = moge_out["depth"][0].float()
+        if fg0.any():
+            baseline_moge_depth_mean_m = float(moge_depth[fg0].mean().item())
+        else:
+            baseline_moge_depth_mean_m = float("nan")
+        # MoGe-2 returns *normalized* OpenCV intrinsics
+        # (fx = 1 / (2 tan(fov_x/2))).
+        moge_fx_norm = float(moge_out["intrinsics"][0, 0, 0].item())
+        baseline_moge_fov_x_deg = float(
+            np.degrees(2.0 * np.arctan(0.5 / max(moge_fx_norm, 1e-8)))
         )
-        m["recovered_fov_x_deg"] = float(fov_x)
-        m["inference_s"] = round(dt, 2)
+
+        # ---- r75b layer-0 + multilayer metrics (skipped if checkpoint missing). ----
+        if r75b_available:
+            torch.manual_seed(SEED)
+            torch.cuda.manual_seed(SEED)
+            t0 = time.time()
+            with torch.no_grad(), autocast_ctx, _bypass_activation_checkpointing(model):
+                xyz_pred, mask_pred, _ = inference_diffusion(
+                    model,
+                    rgb_t,
+                    gt_mask=mask_t,
+                    use_gt_mask=True,
+                    intrinsics=intr_t,
+                    invalid_fill_mode="noise",
+                    **cfg["inference_kwargs"],
+                )
+            dt = time.time() - t0
+
+            xyz = xyz_pred[0].float().cpu().numpy()  # [L, H, W, 3]
+            mask = mask_pred[0].cpu().numpy().astype(bool)  # [L, H, W]
+            m = analyze(xyz, mask)
+
+            K, fov_x = solve_intrinsics_from_xyz(
+                xyz[0], mask[0], image_size=cfg["image_size"]
+            )
+            m["recovered_fov_x_deg"] = float(fov_x)
+            m["inference_s"] = round(dt, 2)
+            m["xyz_shape"] = list(xyz_pred.shape)
+        else:
+            dt = 0.0
+            m = {
+                "num_layers": cfg["model_kwargs"]["num_layers"],
+                "valid_pixels_layer0": int(fg0.sum().item()),
+                "layer0_depth_mean_m": None,
+                "layer0_depth_median_m": None,
+                "per_layer_mean_z_m": None,
+                "front_to_back_monotonic_frac": None,
+                "occluded_thickness_mean_m": None,
+                "occluded_thickness_median_m": None,
+                "occluded_ray_frac": None,
+                "recovered_fov_x_deg": None,
+                "inference_s": 0.0,
+                "xyz_shape": None,
+            }
+        m["baseline_moge_depth_mean_m"] = baseline_moge_depth_mean_m
+        m["baseline_moge_fov_x_deg"] = baseline_moge_fov_x_deg
         m["image"] = name
-        m["xyz_shape"] = list(xyz_pred.shape)
         results.append(m)
+        l0_depth = m["layer0_depth_mean_m"]
+        l0_depth_s = f"{l0_depth:.3f}m" if l0_depth is not None else "n/a"
+        fov_x_val = m["recovered_fov_x_deg"]
+        fov_x_s = f"{fov_x_val:.1f}deg" if fov_x_val is not None else "n/a"
+        mono = m["front_to_back_monotonic_frac"]
+        mono_s = f"{mono:.3f}" if mono is not None else "n/a"
+        occl = m["occluded_ray_frac"]
+        occl_s = f"{occl:.3f}" if occl is not None else "n/a"
+        thick = m["occluded_thickness_mean_m"]
+        thick_s = f"{thick:.3f}m" if thick is not None else "n/a"
         print(
             f"[poc] L={m['num_layers']} shape={m['xyz_shape']} "
-            f"L0_depth={m['layer0_depth_mean_m']:.3f}m fov_x={fov_x:.1f}deg "
-            f"mono={m['front_to_back_monotonic_frac']:.3f} "
-            f"occluded_rays={m['occluded_ray_frac']:.3f} "
-            f"thickness={m['occluded_thickness_mean_m']:.3f}m ({dt:.1f}s)"
+            f"L0_depth={l0_depth_s} fov_x={fov_x_s} "
+            f"mono={mono_s} occluded_rays={occl_s} thickness={thick_s} "
+            f"| moge_L0_depth={baseline_moge_depth_mean_m:.3f}m "
+            f"moge_fov_x={baseline_moge_fov_x_deg:.1f}deg ({dt:.1f}s)"
         )
 
     # ---- Aggregate ----
+    def _mean_or_none(key: str) -> float | None:
+        vals = [r[key] for r in results if r.get(key) is not None]
+        if not vals:
+            return None
+        return round(float(np.mean(vals)), 4)
+
     agg = {
         "config": CONFIG,
         "params_billion": round(n_params, 3),
@@ -169,23 +250,27 @@ def main() -> None:
         "seed": SEED,
         "thickness_eps_m": THICKNESS_EPS,
         "n_images": len(results),
-        "mean_front_to_back_monotonic_frac": round(
-            float(np.mean([r["front_to_back_monotonic_frac"] for r in results])), 4
+        "r75b_available": r75b_available,
+        "mean_front_to_back_monotonic_frac": _mean_or_none(
+            "front_to_back_monotonic_frac"
         ),
-        "mean_occluded_ray_frac": round(
-            float(np.mean([r["occluded_ray_frac"] for r in results])), 4
-        ),
-        "mean_occluded_thickness_m": round(
-            float(np.mean([r["occluded_thickness_mean_m"] for r in results])), 4
-        ),
-        "mean_recovered_fov_x_deg": round(
-            float(np.mean([r["recovered_fov_x_deg"] for r in results])), 2
-        ),
+        "mean_occluded_ray_frac": _mean_or_none("occluded_ray_frac"),
+        "mean_occluded_thickness_m": _mean_or_none("occluded_thickness_mean_m"),
+        "mean_recovered_fov_x_deg": _mean_or_none("recovered_fov_x_deg"),
+        "mean_layer0_depth_m": _mean_or_none("layer0_depth_mean_m"),
+        "mean_baseline_moge_depth_mean_m": _mean_or_none("baseline_moge_depth_mean_m"),
+        "mean_baseline_moge_fov_x_deg": _mean_or_none("baseline_moge_fov_x_deg"),
+        "moge_baseline": "moge-2-vitl-normal",
         "per_image": results,
     }
     (ARTIFACT_DIR / "metrics.json").write_text(json.dumps(agg, indent=2))
 
     # ---- EVAL.md ----
+    def _fmt(val, suffix: str = "", prec: int = 3) -> str:
+        if val is None:
+            return "n/a"
+        return f"{val:.{prec}f}{suffix}"
+
     lines = [
         "# World Tracing r75b -- multilayer-geometry PoC",
         "",
@@ -193,46 +278,71 @@ def main() -> None:
         f"{agg['image_size']}x{agg['image_size']}, L={agg['num_layers']} layers, "
         f"{agg['num_steps']} ODE steps, seed {SEED}",
         f"- images: {agg['n_images']} shipped object test images",
+        f"- r75b checkpoint loaded: {r75b_available}",
+        f"- MoGe-2 baseline: {agg['moge_baseline']} (public, no HF gating); "
+        "r75b freezes this encoder, so the baseline columns isolate the frozen "
+        "encoder contribution from the diffusion decoder on layer 0",
         "",
         "## Core-claim metrics (per image)",
         "",
-        "| image | xyz shape | L0 depth (m) | fov_x | front->back mono | "
+        "| image | xyz shape | r75b L0 depth (m) | r75b fov_x | "
+        "MoGe-2 L0 depth (m) | MoGe-2 fov_x | front->back mono | "
         "occluded rays | thickness (m) | time |",
-        "|---|---|---|---|---|---|---|---|",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in results:
         lines.append(
             f"| {r['image']} | {r['xyz_shape']} | "
-            f"{r['layer0_depth_mean_m']:.3f} | {r['recovered_fov_x_deg']:.1f} | "
-            f"{r['front_to_back_monotonic_frac']:.3f} | "
-            f"{r['occluded_ray_frac']:.3f} | "
-            f"{r['occluded_thickness_mean_m']:.3f} | {r['inference_s']}s |"
+            f"{_fmt(r['layer0_depth_mean_m'])} | "
+            f"{_fmt(r['recovered_fov_x_deg'], prec=1)} | "
+            f"{_fmt(r['baseline_moge_depth_mean_m'])} | "
+            f"{_fmt(r['baseline_moge_fov_x_deg'], prec=1)} | "
+            f"{_fmt(r['front_to_back_monotonic_frac'])} | "
+            f"{_fmt(r['occluded_ray_frac'])} | "
+            f"{_fmt(r['occluded_thickness_mean_m'])} | {r['inference_s']}s |"
         )
     lines += [
         "",
         "## Aggregate",
         "",
         f"- mean front-to-back monotonic fraction: "
-        f"{agg['mean_front_to_back_monotonic_frac']:.3f} "
+        f"{_fmt(agg['mean_front_to_back_monotonic_frac'])} "
         f"(deeper layers lie behind nearer ones)",
         f"- mean occluded-ray fraction (thickness > {THICKNESS_EPS} m): "
-        f"{agg['mean_occluded_ray_frac']:.3f} "
+        f"{_fmt(agg['mean_occluded_ray_frac'])} "
         f"(rays where the model generated real geometry behind the visible surface)",
-        f"- mean occluded thickness: {agg['mean_occluded_thickness_m']:.3f} m",
-        f"- mean recovered horizontal FoV: {agg['mean_recovered_fov_x_deg']:.1f} deg "
+        f"- mean occluded thickness: "
+        f"{_fmt(agg['mean_occluded_thickness_m'], suffix=' m')}",
+        f"- mean recovered horizontal FoV (r75b layer 0): "
+        f"{_fmt(agg['mean_recovered_fov_x_deg'], suffix=' deg', prec=1)} "
         f"(training renders use ~54.7 deg)",
+        f"- mean MoGe-2 baseline layer-0 depth: "
+        f"{_fmt(agg['mean_baseline_moge_depth_mean_m'], suffix=' m')}",
+        f"- mean MoGe-2 baseline horizontal FoV: "
+        f"{_fmt(agg['mean_baseline_moge_fov_x_deg'], suffix=' deg', prec=1)}",
         "",
         "A single forward pass yields a 6-layer XYZ stack per pixel. Layer 0 is a "
         "metric, camera-consistent visible surface (FoV recovered from it alone, no "
         "external pose estimator). Deeper layers stay behind it (high monotonic "
         "fraction) and add real occluded geometry on a large fraction of rays. This "
-        "reproduces the paper's pixel-aligned multilayer-geometry representation.",
+        "reproduces the paper's pixel-aligned multilayer-geometry representation. "
+        "The MoGe-2 columns are a public-weights baseline for the layer-0 numbers: "
+        "because r75b freezes the MoGe encoder, the gap between the MoGe-2 columns "
+        "and the r75b layer-0 columns measures the diffusion decoder's effect on "
+        "depth / FoV, while the MoGe-2 columns alone are produced even when the "
+        "gated r75b checkpoint cannot be downloaded.",
     ]
     (ARTIFACT_DIR / "EVAL.md").write_text("\n".join(lines))
     print("\n[poc] wrote .openresearch/artifacts/EVAL.md and metrics.json")
-    print(f"[poc] aggregate: mono={agg['mean_front_to_back_monotonic_frac']:.3f} "
-          f"occluded_rays={agg['mean_occluded_ray_frac']:.3f} "
-          f"fov_x={agg['mean_recovered_fov_x_deg']:.1f}deg")
+    print(
+        f"[poc] aggregate: mono={_fmt(agg['mean_front_to_back_monotonic_frac'])} "
+        f"occluded_rays={_fmt(agg['mean_occluded_ray_frac'])} "
+        f"fov_x={_fmt(agg['mean_recovered_fov_x_deg'], suffix='deg', prec=1)} "
+        f"moge_L0_depth="
+        f"{_fmt(agg['mean_baseline_moge_depth_mean_m'], suffix='m')} "
+        f"moge_fov_x="
+        f"{_fmt(agg['mean_baseline_moge_fov_x_deg'], suffix='deg', prec=1)}"
+    )
 
 
 if __name__ == "__main__":
