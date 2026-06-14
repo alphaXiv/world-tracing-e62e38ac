@@ -19,6 +19,10 @@ machine-readable evidence so the claim can be judged numerically:
     ones, the front-to-back ordering the paper enforces)
   * generated occluded-surface "thickness": per-ray (z_last - z_0) > eps,
     i.e. deeper layers are genuinely behind the visible surface, not copies
+  * use_gt_mask=False ablation: same metrics (mono / occluded-ray / fov_x)
+    plus predicted-mask IoU vs the GT alpha matte, to show how much of the
+    multilayer-geometry evidence depends on the model being handed the
+    silhouette versus recovering its own (no GT mask in real deployments).
 
 Artifacts written to .openresearch/artifacts/:
   * EVAL.md      -- human-readable summary table
@@ -124,6 +128,7 @@ def main() -> None:
         )
         rgb_t, mask_t, intr_t = rgb_t.to(device), mask_t.to(device), intr_t.to(device)
 
+        # --- GT-mask regime (alpha matte handed to the model) ---
         torch.manual_seed(SEED)
         torch.cuda.manual_seed(SEED)
         t0 = time.time()
@@ -150,13 +155,65 @@ def main() -> None:
         m["inference_s"] = round(dt, 2)
         m["image"] = name
         m["xyz_shape"] = list(xyz_pred.shape)
+
+        # --- Predicted-mask regime (model recovers its own silhouette) ---
+        # gt_mask is still passed so invalid_fill_mode='noise' has its
+        # valid-mask conditioning, but the predicted mask channel is used
+        # to gate the geometry instead of being overridden.
+        torch.manual_seed(SEED)
+        torch.cuda.manual_seed(SEED)
+        t0p = time.time()
+        with torch.no_grad(), autocast_ctx, _bypass_activation_checkpointing(model):
+            xyz_pred_p, mask_pred_p, _ = inference_diffusion(
+                model,
+                rgb_t,
+                gt_mask=mask_t,
+                use_gt_mask=False,
+                intrinsics=intr_t,
+                invalid_fill_mode="noise",
+                **cfg["inference_kwargs"],
+            )
+        dtp = time.time() - t0p
+
+        xyz_p = xyz_pred_p[0].float().cpu().numpy()
+        mask_p = mask_pred_p[0].cpu().numpy().astype(bool)
+
+        # Layer-0 IoU between predicted silhouette and GT alpha matte.
+        gt0 = mask_t[0, 0].bool().cpu().numpy()
+        pred0 = mask_p[0]
+        inter = np.logical_and(pred0, gt0).sum()
+        union = np.logical_or(pred0, gt0).sum()
+        iou = float(inter) / float(union) if union > 0 else float("nan")
+        m["predicted_mask_iou_vs_gt"] = iou
+
+        # Front-to-back / occluded / FoV metrics under the predicted mask.
+        # Guard against the (unlikely) case of an empty layer-0 prediction.
+        if pred0.any():
+            mp = analyze(xyz_p, mask_p)
+            _, fov_x_p = solve_intrinsics_from_xyz(
+                xyz_p[0], mask_p[0], image_size=cfg["image_size"]
+            )
+            m["mono_frac_pred_mask"] = mp["front_to_back_monotonic_frac"]
+            m["occluded_ray_frac_pred_mask"] = mp["occluded_ray_frac"]
+            m["recovered_fov_x_deg_pred_mask"] = float(fov_x_p)
+        else:
+            m["mono_frac_pred_mask"] = float("nan")
+            m["occluded_ray_frac_pred_mask"] = float("nan")
+            m["recovered_fov_x_deg_pred_mask"] = float("nan")
+        m["inference_s_pred_mask"] = round(dtp, 2)
+
         results.append(m)
         print(
             f"[poc] L={m['num_layers']} shape={m['xyz_shape']} "
             f"L0_depth={m['layer0_depth_mean_m']:.3f}m fov_x={fov_x:.1f}deg "
             f"mono={m['front_to_back_monotonic_frac']:.3f} "
             f"occluded_rays={m['occluded_ray_frac']:.3f} "
-            f"thickness={m['occluded_thickness_mean_m']:.3f}m ({dt:.1f}s)"
+            f"thickness={m['occluded_thickness_mean_m']:.3f}m "
+            f"| pred_mask: iou={iou:.3f} "
+            f"mono={m['mono_frac_pred_mask']:.3f} "
+            f"occluded_rays={m['occluded_ray_frac_pred_mask']:.3f} "
+            f"fov_x={m['recovered_fov_x_deg_pred_mask']:.1f}deg "
+            f"({dt:.1f}s+{dtp:.1f}s)"
         )
 
     # ---- Aggregate ----
@@ -181,6 +238,19 @@ def main() -> None:
         "mean_recovered_fov_x_deg": round(
             float(np.mean([r["recovered_fov_x_deg"] for r in results])), 2
         ),
+        # --- Predicted-mask regime (use_gt_mask=False ablation) ---
+        "mean_predicted_mask_iou_vs_gt": round(
+            float(np.mean([r["predicted_mask_iou_vs_gt"] for r in results])), 4
+        ),
+        "mean_mono_frac_pred_mask": round(
+            float(np.nanmean([r["mono_frac_pred_mask"] for r in results])), 4
+        ),
+        "mean_occluded_ray_frac_pred_mask": round(
+            float(np.nanmean([r["occluded_ray_frac_pred_mask"] for r in results])), 4
+        ),
+        "mean_recovered_fov_x_deg_pred_mask": round(
+            float(np.nanmean([r["recovered_fov_x_deg_pred_mask"] for r in results])), 2
+        ),
         "per_image": results,
     }
     (ARTIFACT_DIR / "metrics.json").write_text(json.dumps(agg, indent=2))
@@ -194,7 +264,7 @@ def main() -> None:
         f"{agg['num_steps']} ODE steps, seed {SEED}",
         f"- images: {agg['n_images']} shipped object test images",
         "",
-        "## Core-claim metrics (per image)",
+        "## Core-claim metrics (per image, GT-mask regime)",
         "",
         "| image | xyz shape | L0 depth (m) | fov_x | front->back mono | "
         "occluded rays | thickness (m) | time |",
@@ -210,6 +280,30 @@ def main() -> None:
         )
     lines += [
         "",
+        "## Predicted-mask ablation (per image, use_gt_mask=False)",
+        "",
+        "Same forward pass but the model's own mask channel is used instead of "
+        "the GT alpha matte to gate geometry. `gt_mask` is still passed so the "
+        "`invalid_fill_mode='noise'` conditioning is unchanged; only the mask "
+        "override is disabled. This isolates how much of the multilayer-geometry "
+        "evidence depends on being handed the silhouette versus the model "
+        "recovering it on its own (in any real deployment the GT mask is not "
+        "available).",
+        "",
+        "| image | pred-mask IoU vs GT | fov_x | front->back mono | "
+        "occluded rays | time |",
+        "|---|---|---|---|---|---|",
+    ]
+    for r in results:
+        lines.append(
+            f"| {r['image']} | {r['predicted_mask_iou_vs_gt']:.3f} | "
+            f"{r['recovered_fov_x_deg_pred_mask']:.1f} | "
+            f"{r['mono_frac_pred_mask']:.3f} | "
+            f"{r['occluded_ray_frac_pred_mask']:.3f} | "
+            f"{r['inference_s_pred_mask']}s |"
+        )
+    lines += [
+        "",
         "## Aggregate",
         "",
         f"- mean front-to-back monotonic fraction: "
@@ -222,11 +316,24 @@ def main() -> None:
         f"- mean recovered horizontal FoV: {agg['mean_recovered_fov_x_deg']:.1f} deg "
         f"(training renders use ~54.7 deg)",
         "",
+        "Predicted-mask regime (use_gt_mask=False):",
+        "",
+        f"- mean predicted-mask IoU vs GT: "
+        f"{agg['mean_predicted_mask_iou_vs_gt']:.3f}",
+        f"- mean front-to-back monotonic fraction (pred mask): "
+        f"{agg['mean_mono_frac_pred_mask']:.3f}",
+        f"- mean occluded-ray fraction (pred mask): "
+        f"{agg['mean_occluded_ray_frac_pred_mask']:.3f}",
+        f"- mean recovered horizontal FoV (pred mask): "
+        f"{agg['mean_recovered_fov_x_deg_pred_mask']:.1f} deg",
+        "",
         "A single forward pass yields a 6-layer XYZ stack per pixel. Layer 0 is a "
         "metric, camera-consistent visible surface (FoV recovered from it alone, no "
         "external pose estimator). Deeper layers stay behind it (high monotonic "
         "fraction) and add real occluded geometry on a large fraction of rays. This "
-        "reproduces the paper's pixel-aligned multilayer-geometry representation.",
+        "reproduces the paper's pixel-aligned multilayer-geometry representation. "
+        "The predicted-mask ablation column shows whether this still holds when "
+        "the model also has to recover its own silhouette.",
     ]
     (ARTIFACT_DIR / "EVAL.md").write_text("\n".join(lines))
     print("\n[poc] wrote .openresearch/artifacts/EVAL.md and metrics.json")
