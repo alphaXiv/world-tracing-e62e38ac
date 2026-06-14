@@ -13,6 +13,17 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# r75b (haoz19/object-model-6layer) is a gated HF repo: hf_hub_download
+# returned 403 GatedRepoError on both prior PoC runs, so nothing downstream
+# ever ran. Pull HF_TOKEN out of the sandbox secret file so the in-process
+# `token=os.environ.get("HF_TOKEN")` plumbed into wt.checkpoint.download_from_hf
+# actually sees a value.
+if [ -f /root/.openresearch/env ]; then
+    # shellcheck disable=SC1091
+    . /root/.openresearch/env
+fi
+export HF_TOKEN="${HF_TOKEN:-}"
+
 echo "[run] python: $(python --version 2>&1), torch: $(python -c 'import torch; print(torch.__version__)' 2>/dev/null || echo 'not yet installed')"
 
 # wt imports torch.utils.checkpoint.CheckpointPolicy at module load (added in

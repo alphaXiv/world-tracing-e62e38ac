@@ -110,7 +110,8 @@ def download_from_hf(repo_id: str, filename: str = HF_DEFAULT_FILENAME,
             "Install it with `pip install huggingface_hub` (or `pip install wt`)."
         ) from e
     return hf_hub_download(
-        repo_id=repo_id, filename=filename, cache_dir=cache_dir
+        repo_id=repo_id, filename=filename, cache_dir=cache_dir,
+        token=os.environ.get("HF_TOKEN"),
     )
 
 
