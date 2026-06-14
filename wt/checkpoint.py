@@ -243,6 +243,10 @@ CONFIGS = {
         # layer). It MUST run at 840: feeding 504 inputs collapses each
         # 14x14 patch to a near-constant depth (severe OOD on the decoder's
         # RoPE / FRG attention) and the output reads as coarse voxel blocks.
+        # ``hunyuan_shift_factor=2.0`` shifts the Euler timestep schedule so
+        # more of the 20 steps land in the high-noise regime (same trick the
+        # Hunyuan/Wan video flow-matching models use to sharpen layered
+        # geometry without retraining).
         "model_kwargs": _R69E_KWARGS,
         "image_size": 840,
         "inference_kwargs": dict(
@@ -251,9 +255,14 @@ CONFIGS = {
             output_mode="xyz",
             model_task="split_token",
             depth_only=True,
+            hunyuan_shift_factor=2.0,
         ),
     },
     "r76": {
+        # ``hunyuan_shift_factor=3.0`` redistributes the 20 Euler steps
+        # toward the high-noise regime, matching the schedule used by
+        # Hunyuan/Wan video flow-matching models -- this sharpens layered
+        # geometry on dynamic clips without retraining.
         "model_kwargs": _R76_KWARGS,
         "image_size": 336,
         "inference_kwargs": dict(
@@ -262,6 +271,7 @@ CONFIGS = {
             output_mode="xyz",
             model_task="split_token",
             depth_only=True,
+            hunyuan_shift_factor=3.0,
         ),
     },
 }

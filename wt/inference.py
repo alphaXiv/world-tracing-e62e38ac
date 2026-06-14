@@ -228,6 +228,7 @@ def inference_diffusion(
     model_task: str = "joint",
     depth_only: bool = False,
     invalid_fill_mode: str | None = None,
+    hunyuan_shift_factor: float = 1.0,
 ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor | None]:
     """Run multilayer-geometry diffusion sampling on a single RGB image.
 
@@ -236,7 +237,9 @@ def inference_diffusion(
         rgb: ``[B, 3, H, W]`` in ``[0, 1]``.
         num_steps: number of Euler ODE steps.
         total_elements: kept for parity (the release sampler does not depend
-            on it because ``hunyuan_shift_factor=1.0`` is the only mode used).
+            on it because ``hunyuan_shift_factor=1.0`` is the only mode used by
+            default; pass a larger value via the ``hunyuan_shift_factor``
+            argument to spend more Euler steps in the high-noise regime).
         gt_mask: ``[B, L, H, W]`` bool GT mask.  Required for the ``depth_only``
             path (the model does not produce a mask in that mode).
         use_gt_mask: override the predicted mask with ``gt_mask`` (joint mode).
@@ -299,7 +302,13 @@ def inference_diffusion(
         else:
             x_t[:, nc - 1] = 0.5
 
-    pred = denoise_geometry(model, x_t, conditioning, iterations=num_steps)
+    pred = denoise_geometry(
+        model,
+        x_t,
+        conditioning,
+        iterations=num_steps,
+        hunyuan_shift_factor=hunyuan_shift_factor,
+    )
 
     # ---- Mask extraction ----
     if model_task == "mask":
@@ -384,6 +393,7 @@ def inference_diffusion_multiview(
     model_task: str = "split_token",
     depth_only: bool = True,
     invalid_fill_mode: str | None = "noise",
+    hunyuan_shift_factor: float = 1.0,
 ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor | None]:
     """Multi-view counterpart of :func:`inference_diffusion`.
 
@@ -449,7 +459,13 @@ def inference_diffusion_multiview(
         else:
             x_t[:, nc - 1] = 0.5
 
-    pred = denoise_geometry(model, x_t, conditioning, iterations=num_steps)
+    pred = denoise_geometry(
+        model,
+        x_t,
+        conditioning,
+        iterations=num_steps,
+        hunyuan_shift_factor=hunyuan_shift_factor,
+    )
 
     if model_task == "mask":
         if cfm_noise_type == "normal_0_1_sym":
@@ -537,6 +553,7 @@ def inference_video_diffusion(
     model_task: str = "split_token",
     depth_only: bool = False,
     invalid_fill_mode: str | None = None,
+    hunyuan_shift_factor: float = 1.0,
 ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor | None]:
     """r76-style video diffusion (T frames jointly).
 
@@ -596,7 +613,13 @@ def inference_video_diffusion(
         else:
             x_t[:, nc - 1] = 0.5
 
-    pred = denoise_geometry(model, x_t, conditioning, iterations=num_steps)
+    pred = denoise_geometry(
+        model,
+        x_t,
+        conditioning,
+        iterations=num_steps,
+        hunyuan_shift_factor=hunyuan_shift_factor,
+    )
     pred_tl = pred.reshape(batch_size, num_time, num_layers, height, width, nc)
 
     if model_task == "mask":
