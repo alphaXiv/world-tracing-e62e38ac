@@ -21,8 +21,16 @@ machine-readable evidence so the claim can be judged numerically:
     i.e. deeper layers are genuinely behind the visible surface, not copies
 
 Artifacts written to .openresearch/artifacts/:
-  * EVAL.md      -- human-readable summary table
-  * metrics.json -- per-image + aggregate metrics (text, CLI-readable)
+  * EVAL.md                       -- human-readable summary table
+  * metrics.json                  -- per-image + aggregate metrics (text, CLI-readable)
+  * layer{l}_depth_{name}.png     -- per-layer TURBO-colorized depth (l in 0..L-1)
+                                     for each input image, masked by layer-0 silhouette,
+                                     normalized with a single shared (min,max) so layers
+                                     are directly comparable front-to-back.
+  * xyz_{name}.ply                -- ASCII point cloud stacking all L layers' valid XYZ
+                                     with a distinct RGB color per layer, so the
+                                     front-to-back layer separation can be inspected in
+                                     any standard mesh viewer (meshlab, CloudCompare).
 """
 
 from __future__ import annotations
@@ -31,6 +39,7 @@ import json
 import time
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 
@@ -57,6 +66,79 @@ IMAGES = [
 ]
 
 ARTIFACT_DIR = Path(".openresearch/artifacts")
+
+# Per-layer RGB colors for the stacked .ply (front -> back).
+LAYER_COLORS = [
+    (228, 26, 28),    # red       -- layer 0 (visible surface)
+    (255, 127, 0),    # orange    -- layer 1
+    (255, 255, 51),   # yellow    -- layer 2
+    (77, 175, 74),    # green     -- layer 3
+    (55, 126, 184),   # blue      -- layer 4
+    (152, 78, 163),   # purple    -- layer 5 (back-most)
+]
+
+
+def dump_layer_depth_pngs(xyz: np.ndarray, mask: np.ndarray, name: str) -> list[str]:
+    """Write one TURBO-colorized depth PNG per layer, masked by layer-0 silhouette.
+
+    All layers share a single (min,max) normalization computed over all layers'
+    depths on layer-0-valid pixels, so the PNGs are directly comparable and the
+    front-to-back depth progression is visible by eye.
+    """
+    L = xyz.shape[0]
+    zr = xyz[..., 2]  # [L, H, W]
+    valid0 = mask[0]
+    # Shared normalization across all layers (on the layer-0 silhouette).
+    z_vals = zr[:, valid0]
+    z0_min = float(z_vals.min())
+    z_max = float(z_vals.max())
+    scale = 255.0 / max(z_max - z0_min, 1e-6)
+    out: list[str] = []
+    for l in range(L):
+        depth_u8 = cv2.convertScaleAbs((zr[l] - z0_min) * scale)
+        color = cv2.applyColorMap(depth_u8, cv2.COLORMAP_TURBO)
+        color[~valid0] = 0
+        path = ARTIFACT_DIR / f"layer{l}_depth_{name}.png"
+        cv2.imwrite(str(path), color)
+        out.append(path.name)
+    return out
+
+
+def dump_layered_ply(xyz: np.ndarray, mask: np.ndarray, name: str) -> str:
+    """Write a single ASCII .ply stacking all L layers' valid XYZ, colored per layer."""
+    L = xyz.shape[0]
+    pts_chunks: list[np.ndarray] = []
+    col_chunks: list[np.ndarray] = []
+    for l in range(L):
+        valid_l = mask[l]
+        pts = xyz[l][valid_l].reshape(-1, 3).astype(np.float32)
+        if pts.size == 0:
+            continue
+        r, g, b = LAYER_COLORS[l % len(LAYER_COLORS)]
+        col = np.broadcast_to(np.array([r, g, b], dtype=np.uint8), (pts.shape[0], 3))
+        pts_chunks.append(pts)
+        col_chunks.append(col)
+    pts_all = np.concatenate(pts_chunks, axis=0) if pts_chunks else np.zeros((0, 3), np.float32)
+    cols_all = np.concatenate(col_chunks, axis=0) if col_chunks else np.zeros((0, 3), np.uint8)
+    n = pts_all.shape[0]
+    path = ARTIFACT_DIR / f"xyz_{name}.ply"
+    header = (
+        "ply\n"
+        "format ascii 1.0\n"
+        f"element vertex {n}\n"
+        "property float x\n"
+        "property float y\n"
+        "property float z\n"
+        "property uchar red\n"
+        "property uchar green\n"
+        "property uchar blue\n"
+        "end_header\n"
+    )
+    with open(path, "w") as f:
+        f.write(header)
+        for (x, y, z), (r, g, b) in zip(pts_all, cols_all):
+            f.write(f"{x:.6f} {y:.6f} {z:.6f} {int(r)} {int(g)} {int(b)}\n")
+    return path.name
 
 
 def analyze(xyz: np.ndarray, mask: np.ndarray) -> dict:
@@ -154,6 +236,11 @@ def main() -> None:
         mask = mask_pred[0].cpu().numpy().astype(bool)  # [L, H, W]
         m = analyze(xyz, mask)
 
+        # Qualitative per-image artifacts so a reviewer can eyeball the
+        # multilayer geometry claim directly (front-to-back layer separation).
+        depth_pngs = dump_layer_depth_pngs(xyz, mask, name)
+        ply_name = dump_layered_ply(xyz, mask, name)
+
         K, fov_x = solve_intrinsics_from_xyz(
             xyz[0], mask[0], image_size=cfg["image_size"]
         )
@@ -161,6 +248,8 @@ def main() -> None:
         m["inference_s"] = round(dt, 2)
         m["image"] = name
         m["xyz_shape"] = list(xyz_pred.shape)
+        m["depth_pngs"] = depth_pngs
+        m["xyz_ply"] = ply_name
         results.append(m)
         print(
             f"[poc] L={m['num_layers']} shape={m['xyz_shape']} "
@@ -222,6 +311,26 @@ def main() -> None:
             f"{r['pairwise_nondecreasing_frac']:.3f} | "
             f"{r['occluded_ray_frac']:.3f} | "
             f"{r['occluded_thickness_mean_m']:.3f} | {r['inference_s']}s |"
+        )
+    lines += [
+        "",
+        "## Per-image qualitative artifacts",
+        "",
+        "Each image's 6-layer prediction is dumped as (a) one TURBO-colorized depth "
+        "PNG per layer (shared min/max normalization, masked by the layer-0 "
+        "silhouette) and (b) a single ASCII `.ply` point cloud stacking all 6 layers' "
+        "valid XYZ with a distinct color per layer (red=L0 visible surface ... "
+        "purple=L5 back-most). Open the `.ply` in any mesh viewer to see "
+        "front-to-back layer separation directly.",
+        "",
+    ]
+    for r in results:
+        depth_links = " ".join(
+            f"[L{l}](./{png})" for l, png in enumerate(r["depth_pngs"])
+        )
+        lines.append(
+            f"- **{r['image']}**: depths {depth_links} | "
+            f"point cloud [`{r['xyz_ply']}`](./{r['xyz_ply']})"
         )
     lines += [
         "",
