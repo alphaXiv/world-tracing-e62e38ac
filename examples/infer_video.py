@@ -48,6 +48,7 @@ from wt.checkpoint import build_model_and_load_ckpt
 from wt.cli import add_common_args, parse_bg_color, resolve_seeds
 from wt.data import load_video_clip, preprocess_clip_for_model
 from wt.inference import _bypass_activation_checkpointing
+from wt.postproc import DYNAMIC_PRESET_SOFT_L0, filter_edge_flyers_clip
 from wt.viz import (
     init_recording_video,
     log_video_clip_prediction,
@@ -82,6 +83,19 @@ def main():
         ),
     )
     add_common_args(p, default_out="infer_video.rrd")
+    p.add_argument(
+        "--postproc",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Apply the ``DYNAMIC_PRESET_SOFT_L0`` flyer filter "
+            "(``wt.postproc.filter_edge_flyers_clip``) to each seed's "
+            "predicted clip before logging.  This removes the X-Z "
+            "depth-spike arcs and gray ghost-dot flyers the preset was "
+            "tuned to suppress on r76 outputs.  Pass ``--no-postproc`` "
+            "to log the raw sampler output."
+        ),
+    )
     args = p.parse_args()
     if args.config != "r76":
         print(
@@ -154,6 +168,16 @@ def main():
             )
         seeds_xyz.append(xyz_pred[0].float().cpu().numpy())  # [T, L, H, W, 3]
         seeds_mask.append(mask_pred[0].cpu().numpy().astype(bool))  # [T, L, H, W]
+
+    if args.postproc:
+        print(
+            "[wt] applying DYNAMIC_PRESET_SOFT_L0 flyer filter "
+            f"to {len(seeds_xyz)} seed clip(s) ..."
+        )
+        for i in range(len(seeds_xyz)):
+            seeds_xyz[i], seeds_mask[i] = filter_edge_flyers_clip(
+                seeds_xyz[i], seeds_mask[i], **DYNAMIC_PRESET_SOFT_L0
+            )
 
     K_solved, fov_x = solve_intrinsics_from_xyz(
         seeds_xyz[0][0, 0], seeds_mask[0][0, 0], image_size=cfg["image_size"]
